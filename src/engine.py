@@ -522,11 +522,13 @@ class Engine:
                 # Continuous stream across provider segments (single pacer per call)
                 'continuous_stream': bool(getattr(config.streaming, 'continuous_stream', True)),
                 # Audio normalizer (RMS make-up gain prior to μ-law encode)
-                'normalizer': {
-                    'enabled': bool(getattr(getattr(config, 'streaming', {}), 'normalizer', {}).get('enabled', True)) if hasattr(config, 'streaming') else True,
-                    'target_rms': int(getattr(getattr(config, 'streaming', {}), 'normalizer', {}).get('target_rms', 1400)) if hasattr(config, 'streaming') else 1400,
-                    'max_gain_db': float(getattr(getattr(config, 'streaming', {}), 'normalizer', {}).get('max_gain_db', 9.0)) if hasattr(config, 'streaming') else 9.0,
-                },
+                'normalizer': (
+                    lambda _n: {
+                        'enabled': bool(getattr(_n, 'enabled', True) if not isinstance(_n, dict) else _n.get('enabled', True)),
+                        'target_rms': int(getattr(_n, 'target_rms', 1400) if not isinstance(_n, dict) else _n.get('target_rms', 1400)),
+                        'max_gain_db': float(getattr(_n, 'max_gain_db', 9.0) if not isinstance(_n, dict) else _n.get('max_gain_db', 9.0)),
+                    }
+                )(getattr(config.streaming, 'normalizer', None) or {}),
                 # Diagnostics (optional): enable short PCM taps pre/post compand
                 'diag_enable_taps': bool(getattr(config.streaming, 'diag_enable_taps', False)),
                 'diag_pre_secs': int(getattr(config.streaming, 'diag_pre_secs', 0) or 0),
@@ -17360,7 +17362,10 @@ class Engine:
 
                                     if deferred_action:
                                         transfer_message = str(result.get("message") or "").strip()
-                                        if transfer_message:
+                                        # Script/LLM already spoke the transfer line this turn —
+                                        # do not play a second "Transferring you to …" announcement.
+                                        already_announced = bool(str(response_text or "").strip())
+                                        if transfer_message and not already_announced:
                                             try:
                                                 conversation_history.append(_ts_msg("assistant", transfer_message))
                                                 session.conversation_history = list(conversation_history)
@@ -17388,6 +17393,19 @@ class Engine:
                                                         )
                                             except Exception:
                                                 logger.error("Deferred transfer TTS failed; committing transfer anyway", call_id=call_id, exc_info=True)
+                                        elif already_announced and playback_id:
+                                            try:
+                                                await self.playback_manager.wait_for_playback_end(
+                                                    call_id,
+                                                    playback_id,
+                                                    timeout_sec=max(8.0, len(str(response_text or "")) * 0.12),
+                                                )
+                                            except Exception:
+                                                logger.debug(
+                                                    "Wait for pre-transfer announcement failed",
+                                                    call_id=call_id,
+                                                    exc_info=True,
+                                                )
 
                                         await self._commit_pending_deferred_transfer_for_call(call_id, session)
                                         return

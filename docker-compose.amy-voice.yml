@@ -1,0 +1,53 @@
+# Second local AI server for Clara Amy clone (Piper en_US-amy-medium).
+# STT stays on primary :8765; this instance only serves TTS on :8766.
+#
+# Usage (with existing host networking):
+#   docker compose -f docker-compose.yml -f docker-compose.host.yml \
+#     -f docker-compose.amy-voice.yml up -d local_ai_server_amy
+
+services:
+  local_ai_server_amy:
+    image: asterisk-ai-voice-agent-local-ai-server:latest
+    pull_policy: never
+    container_name: local_ai_server_amy
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./local_ai_server/server.py:/app/server.py:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOCAL_WS_PORT=8766
+      - LOCAL_WS_URL=ws://127.0.0.1:8766
+      - LOCAL_TTS_BACKEND=piper
+      - LOCAL_TTS_MODEL_PATH=/app/models/tts/en_US-amy-medium.onnx
+      - LOCAL_AI_MODE=minimal
+      - LOCAL_TTS_PHRASE_CACHE_ENABLED=true
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          python - <<'PY'
+          import asyncio, json, os, websockets
+          async def main():
+              port = os.getenv("LOCAL_WS_PORT", "8766")
+              uri = f"ws://127.0.0.1:{port}"
+              ws = await websockets.connect(uri, ping_interval=None, ping_timeout=None, close_timeout=2, max_size=None)
+              try:
+                  await ws.send(json.dumps({"type": "status"}))
+                  data = json.loads(await ws.recv())
+                  if data.get("type") != "status_response" or data.get("status") != "ok":
+                      raise RuntimeError(data)
+              finally:
+                  await ws.close()
+          asyncio.run(main())
+          PY
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s

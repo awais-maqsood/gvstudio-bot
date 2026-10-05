@@ -867,7 +867,7 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                         transcript_preview=(message.get("text") or "")[:80],
                     )
                     continue
-                text = (message.get("text") or "")
+                text = (message.get("text") or "").strip()
                 session.last_final_result_ts = time.time()
                 logger.info(
                     "Local STT final received by adapter",
@@ -876,6 +876,9 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                     transcript_preview=text[:80],
                     receiver_restart_count=session.receiver_restart_count,
                 )
+                # Empty finals (Kroko silence endpoints) must not enter the dialog queue.
+                if not text or not any(ch.isalnum() for ch in text):
+                    continue
                 try:
                     queue.put_nowait(text)
                 except asyncio.QueueFull:

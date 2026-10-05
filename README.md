@@ -1326,3 +1326,5 @@ If you find this project useful, please also give it a ⭐️!
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=hkjarral/AVA-AI-Voice-Agent-for-Asterisk&type=date&legend=top-left&sealed_token=OFUaTIQ_cHQIeI9JOUvCGWT1NhM4MLx-xr5TRZEdODgPVlh-fSiAKxhs6Oa328sldbZyjiYVOHXlxkkn02lMmVdoYXZdQRMWI72Dzjddo9VI67yQaZHOqg" />
  </picture>
 </a>
+
+# gvstudio-bot

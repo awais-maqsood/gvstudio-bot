@@ -47,6 +47,7 @@ from .telnyx import TelnyxLLMAdapter
 from .azure import AzureSTTFastAdapter, AzureSTTRealtimeAdapter, AzureTTSAdapter
 from .cambai import CambAiTTSAdapter
 from .fish_audio import FishAudioTTSAdapter
+from .script import ScriptLLMAdapter
 
 logger = get_logger(__name__)
 
@@ -850,6 +851,17 @@ class PipelineOrchestrator:
             )
         else:
             logger.debug("Ollama LLM adapter disabled by provider configuration")
+
+        # Deterministic keyword script (STT → fixed TTS + tools; no neural LLM)
+        def _script_llm_factory(component_key: str, options: Dict[str, Any]) -> Component:
+            return ScriptLLMAdapter(component_key, options)
+
+        self.register_factory("script_llm", _script_llm_factory)
+        logger.info(
+            "Script LLM adapter registered",
+            llm_factory="script_llm",
+            note="Deterministic Clara CGM yes/no flow without LLM",
+        )
 
         self._register_configured_llm_factories()
 

@@ -2161,12 +2161,48 @@ class LocalAIServer:
 
             self.tts_model = PiperVoice.load(self.tts_model_path)
             logging.info("✅ TTS backend: Piper loaded from %s (22kHz native)", self.tts_model_path)
+            await self._warm_script_tts_cache()
         except Exception as exc:
             logging.error("❌ Failed to load Piper TTS model: %s", exc)
             self.tts_model = None
             self.startup_errors["tts"] = str(exc)
             if self.fail_fast:
                 raise
+
+    async def _warm_script_tts_cache(self) -> None:
+        """Pre-synthesize fixed Clara script lines so first call is cache-hit fast."""
+        if not getattr(self.config, "tts_phrase_cache_enabled", False):
+            return
+        if not self.tts_model:
+            return
+        phrases = [
+            (
+                "Hey There, this is Clara about a free glucose monitor covered by insurance. "
+                "Quick check: do you currently have Medicare Part A and Part B?"
+            ),
+            "Just to confirm — do you currently have Medicare Part A and Part B?",
+            "Are you above the age of sixty-five?",
+            "Are you diabetic?",
+            "Ok, thanks.",
+            (
+                "Perfect — it looks like you qualify. I’m going to transfer your call "
+                "to a specialist who will assist you further. Please hold."
+            ),
+        ]
+        warmed = 0
+        for phrase in phrases:
+            if len(phrase) > int(getattr(self.config, "tts_phrase_cache_max_text_len", 200) or 200):
+                continue
+            try:
+                await self.process_tts_audio(
+                    phrase,
+                    output_encoding="linear16",
+                    output_sample_rate_hz=8000,
+                )
+                warmed += 1
+            except Exception as exc:
+                logging.warning("TTS warm cache failed for phrase preview=%s err=%s", phrase[:40], exc)
+        logging.info("🔥 TTS phrase cache warmed entries=%d", warmed)
 
     async def _load_kokoro_backend(self):
         """Initialize Kokoro TTS backend."""
@@ -3093,10 +3129,10 @@ class LocalAIServer:
 
         if (
             normalized == "linear16"
-            and rate == PCM16_TARGET_RATE
+            and rate in {ULAW_SAMPLE_RATE, PCM16_TARGET_RATE}
             and self.tts_backend in {"piper", "kokoro"}
         ):
-            return "linear16", PCM16_TARGET_RATE
+            return "linear16", rate
         if normalized == "mulaw" and rate == ULAW_SAMPLE_RATE:
             return "mulaw", ULAW_SAMPLE_RATE
 
@@ -4339,6 +4375,19 @@ class LocalAIServer:
         self, session: SessionContext, coroutine, *, reason: str
     ) -> asyncio.Task:
         """Run long LLM/TTS work without blocking WebSocket control messages."""
+        # Do not bump output_generation / cancel while greeting TTS is protected;
+        # that drop leaves the caller with silence (no TTS audio ever emitted).
+        if monotonic() < float(getattr(session, "stt_suppress_until", 0.0) or 0.0):
+            logging.info(
+                "🛑 SESSION OUTPUT CANCEL SKIPPED - call_id=%s reason=%s (STT suppress active)",
+                session.call_id,
+                reason,
+            )
+            coroutine.close()
+            async def _noop():
+                return None
+            task = asyncio.create_task(_noop(), name=f"local-ai-skipped-{reason}-{session.call_id}")
+            return task
         self._cancel_session_response_tasks(session, reason=f"replace:{reason}")
         async def _run_with_call_log_context():
             token = _CALL_LOG_CONTEXT.set(str(session.call_id or "unknown"))
@@ -5569,6 +5618,11 @@ class LocalAIServer:
         if audio_bytes:
             await self._send_bytes(websocket, audio_bytes)
 
+    def _stt_echo_suppress_enabled(self) -> bool:
+        """Backends that should hold STT while agent TTS is generating/playing."""
+        _sherpa_offline = self.stt_backend == "sherpa" and getattr(self, "sherpa_model_type", "online") == "offline"
+        return self.stt_backend in {"faster_whisper", "whisper_cpp", "kroko"} or _sherpa_offline
+
     def _arm_whisper_stt_suppression(
         self,
         session: SessionContext,
@@ -5578,18 +5632,22 @@ class LocalAIServer:
         is_streaming: bool = False,
         encoding: str = "mulaw",
         sample_rate_hz: int = ULAW_SAMPLE_RATE,
+        min_seconds: float = 0.0,
     ) -> None:
-        _sherpa_offline = self.stt_backend == "sherpa" and getattr(self, "sherpa_model_type", "online") == "offline"
-        if self.stt_backend not in {"faster_whisper", "whisper_cpp"} and not _sherpa_offline:
-            return
-        if not audio_bytes:
+        if not self._stt_echo_suppress_enabled():
             return
 
-        bytes_per_sample = 2 if encoding == "linear16" else 1
-        duration_s = float(len(audio_bytes)) / float(
-            max(1, sample_rate_hz * bytes_per_sample)
-        )
-        grace_s = 0.25
+        duration_s = float(min_seconds or 0.0)
+        if audio_bytes:
+            bytes_per_sample = 2 if encoding == "linear16" else 1
+            duration_s = max(
+                duration_s,
+                float(len(audio_bytes)) / float(max(1, sample_rate_hz * bytes_per_sample)),
+            )
+        if duration_s <= 0:
+            return
+
+        grace_s = 0.75
         if is_streaming:
             # For multi-chunk streaming, stack chunk durations on top of existing
             # suppression so the total window covers the full playback queue.
@@ -5597,14 +5655,17 @@ class LocalAIServer:
             until = base + duration_s + grace_s
         else:
             until = monotonic() + duration_s + grace_s
-        if until <= session.stt_suppress_until:
+        # Allow known audio duration (tts_request) to replace an earlier
+        # overestimate from tts_request_start so short greetings don't mute STT.
+        force_replace = bool(audio_bytes) and source in {"tts_request", "tts_emit"}
+        if until <= session.stt_suppress_until and not force_replace:
             return
 
         session.stt_suppress_until = until
         self._cancel_idle_timer(session)
         self._reset_stt_session(session, "")
         logging.info(
-            "🔇 WHISPER STT SUPPRESS - Holding STT while TTS plays call_id=%s backend=%s source=%s seconds=%.2f",
+            "🔇 STT SUPPRESS - Holding STT while TTS plays call_id=%s backend=%s source=%s seconds=%.2f",
             session.call_id,
             self.stt_backend,
             source,
@@ -5612,15 +5673,14 @@ class LocalAIServer:
         )
 
     def _clear_whisper_stt_suppression(self, session: SessionContext, *, reason: str) -> None:
-        _sherpa_offline = self.stt_backend == "sherpa" and getattr(self, "sherpa_model_type", "online") == "offline"
-        if self.stt_backend not in {"faster_whisper", "whisper_cpp"} and not _sherpa_offline:
+        if not self._stt_echo_suppress_enabled():
             return
         current_until = float(getattr(session, "stt_suppress_until", 0.0) or 0.0)
         if current_until <= monotonic():
             return
         session.stt_suppress_until = 0.0
         logging.info(
-            "🔊 WHISPER STT SUPPRESSION CLEARED - call_id=%s backend=%s reason=%s",
+            "🔊 STT SUPPRESSION CLEARED - call_id=%s backend=%s reason=%s",
             session.call_id,
             self.stt_backend,
             reason,
@@ -6322,13 +6382,11 @@ class LocalAIServer:
 
         stt_modes = {"stt", "llm", "full"}
         if mode in stt_modes:
-            _suppress_backends = {"faster_whisper", "whisper_cpp"}
-            _sherpa_offline = self.stt_backend == "sherpa" and getattr(self, "sherpa_model_type", "online") == "offline"
-            if (self.stt_backend in _suppress_backends or _sherpa_offline) and monotonic() < (session.stt_suppress_until or 0.0):
+            if self._stt_echo_suppress_enabled() and monotonic() < (session.stt_suppress_until or 0.0):
                 if DEBUG_AUDIO_FLOW:
                     remaining = max(0.0, float(session.stt_suppress_until - monotonic()))
                     logging.debug(
-                        "🔇 WHISPER STT SUPPRESSED call_id=%s mode=%s remaining=%.2fs",
+                        "🔇 STT SUPPRESSED call_id=%s mode=%s remaining=%.2fs",
                         session.call_id,
                         mode,
                         remaining,
@@ -6395,6 +6453,10 @@ class LocalAIServer:
                     )
                     if mode == "stt":
                         await final_coro
+                    elif not (text or "").strip():
+                        # Empty Kroko finals must not cancel in-flight LLM/TTS
+                        # via _start_session_response_task (replace:final-transcript).
+                        await final_coro
                     else:
                         self._start_session_response_task(
                             session, final_coro, reason="final-transcript"
@@ -6435,6 +6497,16 @@ class LocalAIServer:
         call_id = data.get("call_id")
         self._bind_session_call_id(session, call_id)
 
+        # Brief hold while TTS renders. Overestimate used to be 20s and blocked
+        # the caller's "yes" after short greetings (~9s audio). Real duration is
+        # applied below once audio bytes exist.
+        self._arm_whisper_stt_suppression(
+            session,
+            None,
+            source="tts_request_start",
+            min_seconds=2.0,
+        )
+
         generation = self._start_output_generation(session)
 
         audio_response = await self._process_session_tts(text, session)
@@ -6452,6 +6524,7 @@ class LocalAIServer:
                 source="tts_request",
                 encoding=audio_response.encoding,
                 sample_rate_hz=audio_response.sample_rate_hz,
+                min_seconds=2.0,
             )
             # Send JSON response with base64-encoded audio for direct TTS calls
             # This is what LocalProvider.text_to_speech expects

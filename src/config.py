@@ -1166,6 +1166,14 @@ class NoInputConfig(BaseModel):
         return normalized
 
 
+class StreamingNormalizerConfig(BaseModel):
+    """Optional RMS make-up gain applied before outbound encode."""
+
+    enabled: bool = Field(default=True)
+    target_rms: int = Field(default=1400)
+    max_gain_db: float = Field(default=9.0)
+
+
 class StreamingConfig(BaseModel):
     sample_rate: int = Field(default=8000)
     jitter_buffer_ms: int = Field(default=50)
@@ -1197,6 +1205,10 @@ class StreamingConfig(BaseModel):
     egress_swap_mode: str = Field(default="auto")
     # When true, force outbound streaming audio to μ-law regardless of provider encoding.
     egress_force_mulaw: bool = Field(default=False)
+    # Keep a continuous outbound pacer across provider segments.
+    continuous_stream: bool = Field(default=True)
+    # Audio normalizer (RMS make-up gain). Disable for cleaner telephony TTS.
+    normalizer: StreamingNormalizerConfig = Field(default_factory=StreamingNormalizerConfig)
     # Overlap LLM token streaming with TTS synthesis in modular pipelines.
     # Streams tokens → splits into sentences → synthesizes each sentence concurrently.
     pipeline_streaming_overlap: bool = Field(default=True)
